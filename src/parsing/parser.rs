@@ -233,6 +233,9 @@ impl ParseState {
         }
 
         let mut regions = Region::new();
+        
+        // Check for escape patterns once for the entire line
+        let escape_position = self.find_earliest_escape_position(line, syntax_set, &mut regions)?;
         let fnv = BuildHasherDefault::<FnvHasher>::default();
         let mut search_cache: SearchCache = HashMap::with_capacity_and_hasher(128, fnv);
         // Used for detecting loops with push/pop, see long comment above.
@@ -246,6 +249,7 @@ impl ParseState {
             &mut regions,
             &mut non_consuming_push_at,
             &mut res,
+            escape_position,
         )? {}
 
         Ok(res)
@@ -261,6 +265,7 @@ impl ParseState {
         regions: &mut Region,
         non_consuming_push_at: &mut (usize, usize),
         ops: &mut Vec<(usize, ScopeStackOp)>,
+        escape_position: Option<usize>,
     ) -> Result<bool, ParsingError> {
         let check_pop_loop = {
             let (pos, stack_depth) = *non_consuming_push_at;
@@ -277,9 +282,6 @@ impl ParseState {
             self.proto_starts.pop();
         }
 
-        // Check for escape patterns and determine visible line segment
-        let (escape_pos, embed_escape_level) = self.check_escape_patterns(line, *start, syntax_set, search_cache, regions)?;
-
         let best_match = self.find_best_match(
             line,
             *start,
@@ -287,8 +289,7 @@ impl ParseState {
             search_cache,
             regions,
             check_pop_loop,
-            escape_pos,
-            embed_escape_level,
+            escape_position,
         )?;
 
         if let Some(reg_match) = best_match {
@@ -430,6 +431,66 @@ impl ParseState {
         }
     }
 
+    fn find_earliest_escape_position(
+        &self,
+        line: &str,
+        syntax_set: &SyntaxSet,
+        regions: &mut Region,
+    ) -> Result<Option<usize>, ParsingError> {
+        let mut earliest_escape_pos = usize::MAX;
+
+        // Check all levels on the stack for escape patterns
+        for level in &self.stack {
+            if let Some(escape_context_id) = level.escape_pattern {
+                // This level IS an escape context
+                let escape_context = syntax_set.get_context(&escape_context_id)?;
+                
+                // Find the escape pattern in this context (should be first pattern with pop: true)
+                for pattern in &escape_context.patterns {
+                    if let Pattern::Match(match_pat) = pattern {
+                        if matches!(match_pat.operation, MatchOperation::Pop) {
+                            // This is the escape pattern - check if it matches anywhere on the line
+                            
+                            // The pattern might have backreferences, so we need to expand them
+                            let effective_regex = if match_pat.has_captures && level.captures.is_some() {
+                                let (regions_ref, text) = level.captures.as_ref().unwrap();
+                                match_pat.regex_with_refs(regions_ref, text)
+                            } else {
+                                match_pat.regex.clone()
+                            };
+                            
+                            if effective_regex.search(line, 0, line.len(), Some(regions)) {
+                                // Find all matches
+                                let mut search_pos = 0;
+                                while search_pos < line.len() {
+                                    if effective_regex.search(line, search_pos, line.len(), Some(regions)) {
+                                        if let Some((start, end)) = regions.pos(0) {
+                                            if start < earliest_escape_pos {
+                                                earliest_escape_pos = start;
+                                            }
+                                            search_pos = end.max(search_pos + 1);
+                                        } else {
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            break; // Only check the first pop pattern
+                        }
+                    }
+                }
+            }
+        }
+
+        if earliest_escape_pos < usize::MAX {
+            Ok(Some(earliest_escape_pos))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn find_best_match<'a>(
         &self,
         line: &str,
@@ -438,8 +499,7 @@ impl ParseState {
         search_cache: &mut SearchCache,
         regions: &mut Region,
         check_pop_loop: bool,
-        escape_pos: Option<usize>,
-        embed_escape_level: Option<usize>,
+        escape_position: Option<usize>,
     ) -> Result<Option<RegexMatch<'a>>, ParsingError> {
         let cur_level = &self.stack[self.stack.len() - 1];
         let context = syntax_set.get_context(&cur_level.context)?;
@@ -475,8 +535,23 @@ impl ParseState {
             for (pat_context, pat_index) in context_iter(syntax_set, syntax_set.get_context(ctx)?) {
                 let match_pat = pat_context.match_at(pat_index)?;
 
+                // Determine if this pattern should see the limited line
+                let is_escape_pattern = self.stack.iter().any(|level| {
+                    level.escape_pattern == Some(*ctx)
+                });
+                
+                let effective_line = if let Some(escape_pos) = escape_position {
+                    if !is_escape_pattern && escape_pos > start {
+                        &line[..escape_pos]
+                    } else {
+                        line
+                    }
+                } else {
+                    line
+                };
+
                 if let Some(match_region) =
-                    self.search_with_escape_limit(line, start, match_pat, captures, search_cache, regions, escape_pos, embed_escape_level, ctx, syntax_set)
+                    self.search(effective_line, start, match_pat, captures, search_cache, regions)
                 {
                     let (match_start, match_end) = match_region.pos(0).unwrap();
 
