@@ -100,10 +100,11 @@ fn load_syntax_file(
 ) -> Result<SyntaxDefinition, LoadingError> {
     let s = std::fs::read_to_string(p)?;
 
-    SyntaxDefinition::load_from_str(
+    SyntaxDefinition::load_from_str_with_path(
         &s,
         lines_include_newline,
         p.file_stem().and_then(|x| x.to_str()),
+        Some(p),
     )
     .map_err(|e| LoadingError::ParseSyntax(e, format!("{}", p.display())))
 }
