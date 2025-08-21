@@ -364,7 +364,7 @@ impl ParseState {
         let mut earliest_escape_pos = usize::MAX;
         let mut escape_stack_level = None;
 
-        println!("Checking escape patterns for line: '{}' from position {}", line, current_pos);
+        // Remove debug output for now
 
         // Check all levels on the stack for escape patterns
         for (level_idx, level) in self.stack.iter().enumerate() {
@@ -476,7 +476,7 @@ impl ParseState {
                 let match_pat = pat_context.match_at(pat_index)?;
 
                 if let Some(match_region) =
-                    self.search_with_escape_limit(line, start, match_pat, captures, search_cache, regions, escape_pos, embed_escape_level)
+                    self.search_with_escape_limit(line, start, match_pat, captures, search_cache, regions, escape_pos, embed_escape_level, ctx, syntax_set)
                 {
                     let (match_start, match_end) = match_region.pos(0).unwrap();
 
@@ -590,9 +590,31 @@ impl ParseState {
         regions: &mut Region,
         escape_pos: Option<usize>,
         embed_escape_level: Option<usize>,
+        current_context_id: &ContextId,
+        syntax_set: &SyntaxSet,
     ) -> Option<Region> {
-        // For debugging, disable line limiting for now
-        self.search(line, start, match_pat, captures, search_cache, regions)
+        // Check if this pattern is from an escape context
+        let is_escape_pattern = if let Some(_) = embed_escape_level {
+            // Check if the current context is an escape context by looking for it in the stack
+            self.stack.iter().any(|level| {
+                level.escape_pattern == Some(*current_context_id)
+            })
+        } else {
+            false
+        };
+
+        let effective_line = if let Some(pos) = escape_pos {
+            if !is_escape_pattern && pos > start {
+                &line[..pos]
+            } else {
+                line
+            }
+        } else {
+            line
+        };
+        
+        // Use the existing search method with the effective line
+        self.search(effective_line, start, match_pat, captures, search_cache, regions)
     }
 
     /// Returns true if the stack was changed
