@@ -278,7 +278,7 @@ impl ParseState {
         }
 
         // Check for escape patterns and determine visible line segment
-        let (escape_pos, embed_escape_level) = self.check_escape_patterns(line, syntax_set, search_cache, regions)?;
+        let (escape_pos, embed_escape_level) = self.check_escape_patterns(line, *start, syntax_set, search_cache, regions)?;
 
         let best_match = self.find_best_match(
             line,
@@ -352,10 +352,11 @@ impl ParseState {
     }
 
     /// Check escape patterns for all embeds on the stack and return the earliest escape position
-    /// and the stack level where it was found (if any)
+    /// that comes after the current parsing position
     fn check_escape_patterns(
         &self,
         line: &str,
+        current_pos: usize,
         syntax_set: &SyntaxSet,
         search_cache: &mut SearchCache,
         regions: &mut Region,
@@ -363,65 +364,57 @@ impl ParseState {
         let mut earliest_escape_pos = usize::MAX;
         let mut escape_stack_level = None;
 
-        println!("Checking escape patterns for line: '{}'", line);
-        println!("Stack has {} levels", self.stack.len());
+        println!("Checking escape patterns for line: '{}' from position {}", line, current_pos);
 
         // Check all levels on the stack for escape patterns
         for (level_idx, level) in self.stack.iter().enumerate() {
-            println!("Level {}: context {:?}, escape_pattern: {:?}", level_idx, level.context, level.escape_pattern);
             if let Some(escape_context_id) = level.escape_pattern {
                 // This level IS an escape context
                 let escape_context = syntax_set.get_context(&escape_context_id)?;
-                println!("Found escape context with {} patterns", escape_context.patterns.len());
                 
                 // Find the escape pattern in this context (should be first pattern with pop: true)
-                for (pat_idx, pattern) in escape_context.patterns.iter().enumerate() {
+                for pattern in &escape_context.patterns {
                     if let Pattern::Match(match_pat) = pattern {
-                        println!("Pattern {}: {:?}, operation: {:?}", pat_idx, match_pat.regex.regex_str(), match_pat.operation);
                         if matches!(match_pat.operation, MatchOperation::Pop) {
                             // This is the escape pattern - check if it matches anywhere on the line
-                            println!("Checking escape pattern '{}' with captures: {:?}", match_pat.regex.regex_str(), level.captures.as_ref().map(|(_, s)| s));
                             
                             // The pattern might have backreferences, so we need to expand them
                             let effective_regex = if match_pat.has_captures && level.captures.is_some() {
                                 let (regions_ref, text) = level.captures.as_ref().unwrap();
-                                let expanded_regex = match_pat.regex_with_refs(regions_ref, text);
-                                println!("Expanded escape regex: '{}'", expanded_regex.regex_str());
-                                expanded_regex
+                                match_pat.regex_with_refs(regions_ref, text)
                             } else {
                                 match_pat.regex.clone()
                             };
                             
                             if effective_regex.search(line, 0, line.len(), Some(regions)) {
-                                if let Some((match_start, _)) = regions.pos(0) {
-                                    println!("Escape pattern matched at position {}", match_start);
-                                    
-                                    // For escape patterns, we need to find matches that come after the embed trigger
-                                    // Let's try searching from different starting positions to find all matches
-                                    let mut search_pos = 0;
-                                    let mut all_matches = Vec::new();
-                                    while search_pos < line.len() {
-                                        if effective_regex.search(line, search_pos, line.len(), Some(regions)) {
-                                            if let Some((start, end)) = regions.pos(0) {
-                                                all_matches.push((start, end));
-                                                search_pos = end.max(search_pos + 1);
-                                            } else {
-                                                break;
-                                            }
+                                // Find all matches and filter for ones after current position
+                                let mut search_pos = 0;
+                                let mut all_matches = Vec::new();
+                                while search_pos < line.len() {
+                                    if effective_regex.search(line, search_pos, line.len(), Some(regions)) {
+                                        if let Some((start, end)) = regions.pos(0) {
+                                            all_matches.push((start, end));
+                                            search_pos = end.max(search_pos + 1);
                                         } else {
                                             break;
                                         }
+                                    } else {
+                                        break;
                                     }
-                                    println!("All escape pattern matches: {:?}", all_matches);
-                                    
-                                    // For now, use the first match (we'll improve this logic later)
-                                    if match_start < earliest_escape_pos {
-                                        earliest_escape_pos = match_start;
+                                }
+                                
+                                // Find the first match that comes at or after the current parsing position
+                                let valid_matches: Vec<_> = all_matches.iter()
+                                    .filter(|(start, _)| *start >= current_pos)
+                                    .collect();
+                                
+                                if !valid_matches.is_empty() {
+                                    let (match_start, _) = valid_matches[0];
+                                    if *match_start < earliest_escape_pos {
+                                        earliest_escape_pos = *match_start;
                                         escape_stack_level = Some(level_idx);
                                     }
                                 }
-                            } else {
-                                println!("Escape pattern did not match");
                             }
                             break; // Only check the first pop pattern
                         }
@@ -431,10 +424,8 @@ impl ParseState {
         }
 
         if earliest_escape_pos < usize::MAX {
-            println!("Earliest escape at position {} from level {:?}", earliest_escape_pos, escape_stack_level);
             Ok((Some(earliest_escape_pos), escape_stack_level))
         } else {
-            println!("No escape patterns matched");
             Ok((None, None))
         }
     }
@@ -598,21 +589,10 @@ impl ParseState {
         search_cache: &mut SearchCache,
         regions: &mut Region,
         escape_pos: Option<usize>,
-        _embed_escape_level: Option<usize>,
+        embed_escape_level: Option<usize>,
     ) -> Option<Region> {
-        // For now, just determine the effective line based on escape position
-        let effective_line = if let Some(pos) = escape_pos {
-            if pos <= start {
-                // If escape position is at or before start, nothing can match
-                return None;
-            }
-            &line[..pos]
-        } else {
-            line
-        };
-        
-        // Use the existing search method with the effective line
-        self.search(effective_line, start, match_pat, captures, search_cache, regions)
+        // For debugging, disable line limiting for now
+        self.search(line, start, match_pat, captures, search_cache, regions)
     }
 
     /// Returns true if the stack was changed
@@ -818,10 +798,6 @@ impl ParseState {
             }
             MatchOperation::None => return Ok(false),
         };
-        println!("perform_op: pushing {} contexts", ctx_refs.len());
-        for (i, r) in ctx_refs.iter().enumerate() {
-            println!("Context {}: {:?}", i, r);
-        }
         for (i, r) in ctx_refs.iter().enumerate() {
             let mut proto_ids = if i == 0 {
                 // it is only necessary to preserve the old prototypes
@@ -851,11 +827,6 @@ impl ParseState {
                             .any(|id| syntax_set.get_context(id).unwrap().uses_backrefs);
                 }
                 if uses_backrefs {
-                    if let Some((start, end)) = regions.pos(1) {
-                        println!("Setting captures for context {}: capture group 1 = '{}'", context_id.context_index, &line[start..end]);
-                    } else {
-                        println!("Setting captures for context {}: no capture group 1", context_id.context_index);
-                    }
                     Some((regions.clone(), line.to_owned()))
                 } else {
                     None
@@ -876,7 +847,6 @@ impl ParseState {
                                 false
                             }
                         });
-                        println!("Context {} has escape pattern: {}", context_id.context_index, has_escape_pattern);
                         if has_escape_pattern {
                             Some(context_id)
                         } else {
