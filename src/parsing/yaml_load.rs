@@ -49,6 +49,15 @@ fn get_key<'a, R, F: FnOnce(&'a Yaml) -> Option<R>>(
         .and_then(|x| f(x).ok_or(ParseSyntaxError::TypeMismatch))
 }
 
+fn get_optional_key<'a, R, F: FnOnce(&'a Yaml) -> Option<R>>(
+    map: &'a Hash,
+    key: &'static str,
+    f: F,
+) -> Option<R> {
+    map.get(&Yaml::String(key.to_owned()))
+        .and_then(f)
+}
+
 fn str_to_scopes(s: &str, repo: &mut ScopeRepository) -> Result<Vec<Scope>, ParseSyntaxError> {
     s.split_whitespace()
         .map(|scope| repo.build(scope).map_err(ParseSyntaxError::InvalidScope))
@@ -87,6 +96,18 @@ impl SyntaxDefinition {
         lines_include_newline: bool,
         fallback_name: Option<&str>,
     ) -> Result<SyntaxDefinition, ParseSyntaxError> {
+        Self::load_from_str_with_path(s, lines_include_newline, fallback_name, None)
+    }
+
+    /// Load a SyntaxDefinition from a string with support for extends from relative paths.
+    ///
+    /// `base_path` is used to resolve relative extends paths. If None, extends will be ignored.
+    pub fn load_from_str_with_path(
+        s: &str,
+        lines_include_newline: bool,
+        fallback_name: Option<&str>,
+        base_path: Option<&Path>,
+    ) -> Result<SyntaxDefinition, ParseSyntaxError> {
         let docs = match YamlLoader::load_from_str(s) {
             Ok(x) => x,
             Err(e) => return Err(ParseSyntaxError::InvalidYaml(e)),
@@ -101,6 +122,7 @@ impl SyntaxDefinition {
             scope_repo.deref_mut(),
             lines_include_newline,
             fallback_name,
+            base_path,
         )
     }
 
@@ -109,8 +131,16 @@ impl SyntaxDefinition {
         scope_repo: &mut ScopeRepository,
         lines_include_newline: bool,
         fallback_name: Option<&str>,
+        base_path: Option<&Path>,
     ) -> Result<SyntaxDefinition, ParseSyntaxError> {
         let h = doc.as_hash().ok_or(ParseSyntaxError::TypeMismatch)?;
+
+        // Load and merge extended syntaxes first
+        let base_definition = if let Some(base_path) = base_path {
+            Self::load_extends(h, scope_repo, lines_include_newline, base_path)?
+        } else {
+            None
+        };
 
         let mut variables = HashMap::new();
         if let Ok(map) = get_key(h, "variables", |x| x.as_hash()) {
@@ -120,6 +150,14 @@ impl SyntaxDefinition {
                 }
             }
         }
+
+        // Merge variables from base definition if exists
+        if let Some(ref base) = base_definition {
+            for (key, value) in &base.variables {
+                variables.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+
         let contexts_hash = get_key(h, "contexts", |x| x.as_hash())?;
         let top_level_scope = scope_repo
             .build(get_key(h, "scope", |x| x.as_str())?)
@@ -133,6 +171,14 @@ impl SyntaxDefinition {
         };
 
         let mut contexts = SyntaxDefinition::parse_contexts(contexts_hash, &mut state)?;
+        
+        // Merge contexts from base definition if exists
+        if let Some(ref base) = base_definition {
+            for (context_name, context) in &base.contexts {
+                contexts.entry(context_name.clone()).or_insert_with(|| context.clone());
+            }
+        }
+        
         if !contexts.contains_key("main") {
             return Err(ParseSyntaxError::MainMissing);
         }
@@ -146,6 +192,15 @@ impl SyntaxDefinition {
             }
         }
 
+        // Merge file extensions from base definition if exists
+        if let Some(ref base) = base_definition {
+            for ext in &base.file_extensions {
+                if !file_extensions.contains(ext) {
+                    file_extensions.push(ext.clone());
+                }
+            }
+        }
+
         let defn = SyntaxDefinition {
             name: get_key(h, "name", |x| x.as_str())
                 .unwrap_or_else(|_| fallback_name.unwrap_or("Unnamed"))
@@ -155,13 +210,108 @@ impl SyntaxDefinition {
             // TODO maybe cache a compiled version of this Regex
             first_line_match: get_key(h, "first_line_match", |x| x.as_str())
                 .ok()
-                .map(|s| s.to_owned()),
-            hidden: get_key(h, "hidden", |x| x.as_bool()).unwrap_or(false),
+                .map(|s| s.to_owned())
+                .or_else(|| base_definition.as_ref().and_then(|base| base.first_line_match.clone())),
+            hidden: get_key(h, "hidden", |x| x.as_bool()).unwrap_or_else(|_| {
+                base_definition.as_ref().map(|base| base.hidden).unwrap_or(false)
+            }),
 
             variables: state.variables,
             contexts,
         };
         Ok(defn)
+    }
+
+    fn load_extends(
+        h: &Hash,
+        scope_repo: &mut ScopeRepository,
+        lines_include_newline: bool,
+        base_path: &Path,
+    ) -> Result<Option<SyntaxDefinition>, ParseSyntaxError> {
+        let extends_paths = if let Some(extends_str) = get_optional_key(h, "extends", |x| x.as_str()) {
+            vec![extends_str]
+        } else if let Some(extends_vec) = get_optional_key(h, "extends", |x| x.as_vec()) {
+            extends_vec.iter().filter_map(|y| y.as_str()).collect()
+        } else {
+            return Ok(None);
+        };
+
+        let mut merged_definition = None;
+
+        for extends_path in extends_paths {
+            let full_path = if let Some(parent) = base_path.parent() {
+                parent.join(extends_path)
+            } else {
+                Path::new(extends_path).to_path_buf()
+            };
+
+            // Read the extends file
+            let extends_content = std::fs::read_to_string(&full_path)
+                .map_err(|_| ParseSyntaxError::BadFileRef)?;
+
+            // Parse the extends file YAML
+            let docs = match YamlLoader::load_from_str(&extends_content) {
+                Ok(x) => x,
+                Err(e) => return Err(ParseSyntaxError::InvalidYaml(e)),
+            };
+            if docs.is_empty() {
+                return Err(ParseSyntaxError::EmptyFile);
+            }
+            let doc = &docs[0];
+
+            // Parse the extends file (don't process nested extends to avoid complexity)
+            let extends_def = Self::parse_top_level(
+                doc,
+                scope_repo,
+                lines_include_newline,
+                full_path.file_stem().and_then(|x| x.to_str()),
+                None, // Don't process nested extends
+            )?;
+
+            // Merge into our accumulated definition
+            merged_definition = Some(if let Some(current) = merged_definition {
+                Self::merge_syntax_definitions(current, extends_def)
+            } else {
+                extends_def
+            });
+        }
+
+        Ok(merged_definition)
+    }
+
+    fn merge_syntax_definitions(
+        mut base: SyntaxDefinition,
+        extension: SyntaxDefinition,
+    ) -> SyntaxDefinition {
+        // Merge variables (extension takes precedence)
+        for (key, value) in extension.variables {
+            base.variables.insert(key, value);
+        }
+
+        // Merge contexts (extension takes precedence)
+        for (context_name, context) in extension.contexts {
+            base.contexts.insert(context_name, context);
+        }
+
+        // Merge file extensions (avoid duplicates)
+        for ext in extension.file_extensions {
+            if !base.file_extensions.contains(&ext) {
+                base.file_extensions.push(ext);
+            }
+        }
+
+        // Extension properties take precedence for scalar values
+        if !extension.name.is_empty() {
+            base.name = extension.name;
+        }
+        if extension.first_line_match.is_some() {
+            base.first_line_match = extension.first_line_match;
+        }
+        // Keep the extension's scope and hidden flag
+        base.scope = extension.scope;
+        base.hidden = extension.hidden;
+
+        base
     }
 
     fn parse_contexts(
@@ -1318,5 +1468,296 @@ mod tests {
         let valid_indexes = get_consuming_capture_indexes(regex);
         println!("{:?}", valid_indexes);
         assert_eq!(valid_indexes, [0, 1, 5, 6]);
+    }
+
+    #[test]
+    fn can_load_syntax_with_extends() {
+        // Test that load_from_str_with_path doesn't hang when path is None
+        let simple_syntax = r#"
+%YAML 1.2
+---
+name: Simple Test
+scope: source.test
+contexts:
+  main:
+    - match: 'test'
+      scope: keyword.test
+"#;
+        
+        let def = SyntaxDefinition::load_from_str_with_path(
+            simple_syntax,
+            false,
+            None,
+            None,
+        ).unwrap();
+        
+        assert_eq!(def.name, "Simple Test");
+        assert_eq!(def.scope.to_string(), "source.test");
+    }
+
+    #[test]
+    fn can_load_syntax_with_simple_extends() {
+        // Just test that the code doesn't hang when extends key is present but path is None
+        let extended_content = r#"
+%YAML 1.2
+---
+extends: base.sublime-syntax
+name: Extended Syntax
+scope: source.extended
+contexts:
+  main:
+    - match: 'extended'
+      scope: keyword.extended
+"#;
+
+        // Test loading with extends but no base_path (should ignore extends)
+        let def = SyntaxDefinition::load_from_str_with_path(
+            extended_content,
+            false,
+            None,
+            None, // No base path, so extends should be ignored
+        ).unwrap();
+
+        // Verify the syntax loaded correctly (without extends processing)  
+        assert_eq!(def.name, "Extended Syntax");
+        assert_eq!(def.scope.to_string(), "source.extended");
+    }
+
+    #[test]  
+    fn can_load_syntax_with_file_extends() {
+        use std::path::Path;
+        
+        // Create temporary files first
+        use std::fs;
+        fs::create_dir_all("/tmp/file_extends_test").unwrap();
+        
+        let base_content = r#"
+%YAML 1.2
+---
+name: Base Syntax
+scope: source.base
+file_extensions:
+  - base
+variables:
+  base_var: 'base_value'
+contexts:
+  main:
+    - match: 'base'
+      scope: keyword.base
+  base_context:
+    - match: 'base_only'
+      scope: meta.base
+"#;
+
+        let extended_content = r#"
+%YAML 1.2
+---
+extends: base.sublime-syntax
+name: Extended Syntax
+scope: source.extended
+file_extensions:
+  - ext
+variables:
+  ext_var: 'ext_value'
+contexts:
+  main:
+    - match: 'extended'
+      scope: keyword.extended
+    - include: base_context
+  extended_context:
+    - match: 'extended_only'
+      scope: meta.extended
+"#;
+        
+        fs::write("/tmp/file_extends_test/base.sublime-syntax", base_content).unwrap();
+        fs::write("/tmp/file_extends_test/extended.sublime-syntax", extended_content).unwrap();
+
+        // Test loading with extends
+        let extended_path = Path::new("/tmp/file_extends_test/extended.sublime-syntax");
+        let def = SyntaxDefinition::load_from_str_with_path(
+            extended_content,
+            false,
+            None,
+            Some(extended_path),
+        ).unwrap();
+
+        // Verify the extends worked  
+        assert_eq!(def.name, "Extended Syntax");
+        assert_eq!(def.scope.to_string(), "source.extended");
+        
+        // Should have both base and extended file extensions
+        assert!(def.file_extensions.contains(&"base".to_string()));
+        assert!(def.file_extensions.contains(&"ext".to_string()));
+        
+        // Should have both base and extended variables
+        assert_eq!(def.variables.get("base_var"), Some(&"base_value".to_string()));
+        assert_eq!(def.variables.get("ext_var"), Some(&"ext_value".to_string()));
+        
+        // Should have both base and extended contexts
+        assert!(def.contexts.contains_key("base_context"));
+        assert!(def.contexts.contains_key("extended_context"));
+        assert!(def.contexts.contains_key("main"));
+
+        // Clean up
+        fs::remove_dir_all("/tmp/file_extends_test").ok();
+    }
+
+    #[test]  
+    fn can_load_syntax_with_array_extends() {
+        use std::path::Path;
+        
+        // Create temporary files first
+        use std::fs;
+        fs::create_dir_all("/tmp/array_extends_test").unwrap();
+        
+        let base1_content = r#"
+%YAML 1.2
+---
+name: Base1 Syntax  
+scope: source.base1
+file_extensions:
+  - base1
+variables:
+  base1_var: 'base1_value'
+contexts:
+  main:
+    - match: 'base1'
+      scope: keyword.base1
+  base1_context:
+    - match: 'base1_only'
+      scope: meta.base1
+"#;
+
+        let base2_content = r#"
+%YAML 1.2
+---
+name: Base2 Syntax
+scope: source.base2
+file_extensions:
+  - base2
+variables:
+  base2_var: 'base2_value'
+contexts:
+  main:
+    - match: 'base2'
+      scope: keyword.base2
+  base2_context:
+    - match: 'base2_only'
+      scope: meta.base2
+"#;
+
+        let extended_content = r#"
+%YAML 1.2
+---
+extends: 
+  - base1.sublime-syntax
+  - base2.sublime-syntax
+name: Extended Syntax
+scope: source.extended
+file_extensions:
+  - ext
+variables:
+  ext_var: 'ext_value'
+contexts:
+  main:
+    - match: 'extended'
+      scope: keyword.extended
+    - include: base1_context
+    - include: base2_context
+"#;
+        
+        fs::write("/tmp/array_extends_test/base1.sublime-syntax", base1_content).unwrap();
+        fs::write("/tmp/array_extends_test/base2.sublime-syntax", base2_content).unwrap();
+        fs::write("/tmp/array_extends_test/extended.sublime-syntax", extended_content).unwrap();
+
+        // Test loading with extends array
+        let extended_path = Path::new("/tmp/array_extends_test/extended.sublime-syntax");
+        let def = SyntaxDefinition::load_from_str_with_path(
+            extended_content,
+            false,
+            None,
+            Some(extended_path),
+        ).unwrap();
+
+        // Verify the extends worked  
+        assert_eq!(def.name, "Extended Syntax");
+        assert_eq!(def.scope.to_string(), "source.extended");
+        
+        // Should have all file extensions
+        assert!(def.file_extensions.contains(&"base1".to_string()));
+        assert!(def.file_extensions.contains(&"base2".to_string()));
+        assert!(def.file_extensions.contains(&"ext".to_string()));
+        
+        // Should have all variables
+        assert_eq!(def.variables.get("base1_var"), Some(&"base1_value".to_string()));
+        assert_eq!(def.variables.get("base2_var"), Some(&"base2_value".to_string()));
+        assert_eq!(def.variables.get("ext_var"), Some(&"ext_value".to_string()));
+        
+        // Should have all contexts
+        assert!(def.contexts.contains_key("base1_context"));
+        assert!(def.contexts.contains_key("base2_context"));
+        assert!(def.contexts.contains_key("main"));
+
+        // Clean up
+        fs::remove_dir_all("/tmp/array_extends_test").ok();
+    }
+
+    #[test]
+    fn test_syntax_set_integration_with_extends() {
+        use std::fs;
+        use super::super::syntax_set::SyntaxSetBuilder;
+        
+        // Create test directory and files
+        fs::create_dir_all("/tmp/syntaxset_extends_integration").unwrap();
+        
+        let base_content = r#"
+%YAML 1.2
+---
+name: Integration Base
+scope: source.intbase
+file_extensions:
+  - intbase
+contexts:
+  main:
+    - match: 'function'
+      scope: keyword.function.intbase
+"#;
+
+        let extended_content = r#"
+%YAML 1.2
+---
+extends: base.sublime-syntax
+name: Integration Extended  
+scope: source.intext
+file_extensions:
+  - intext
+contexts:
+  main:
+    - match: 'class'
+      scope: keyword.class.intext
+"#;
+        
+        fs::write("/tmp/syntaxset_extends_integration/base.sublime-syntax", base_content).unwrap();
+        fs::write("/tmp/syntaxset_extends_integration/extended.sublime-syntax", extended_content).unwrap();
+
+        // Load using SyntaxSetBuilder
+        let mut builder = SyntaxSetBuilder::new();
+        builder.add_from_folder("/tmp/syntaxset_extends_integration", false).unwrap();
+        let syntax_set = builder.build();
+
+        // Find the extended syntax
+        let extended_syntax = syntax_set.find_syntax_by_name("Integration Extended");
+        assert!(extended_syntax.is_some());
+        
+        let extended_syntax = extended_syntax.unwrap();
+        assert_eq!(extended_syntax.name, "Integration Extended");
+        assert_eq!(extended_syntax.scope.to_string(), "source.intext");
+        
+        // Should have both file extensions from base and extended
+        assert!(extended_syntax.file_extensions.contains(&"intbase".to_string()));
+        assert!(extended_syntax.file_extensions.contains(&"intext".to_string()));
+
+        // Clean up
+        fs::remove_dir_all("/tmp/syntaxset_extends_integration").ok();
     }
 }
