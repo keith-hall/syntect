@@ -1701,4 +1701,63 @@ contexts:
         // Clean up
         fs::remove_dir_all("/tmp/array_extends_test").ok();
     }
+
+    #[test]
+    fn test_syntax_set_integration_with_extends() {
+        use std::fs;
+        use super::super::syntax_set::SyntaxSetBuilder;
+        
+        // Create test directory and files
+        fs::create_dir_all("/tmp/syntaxset_extends_integration").unwrap();
+        
+        let base_content = r#"
+%YAML 1.2
+---
+name: Integration Base
+scope: source.intbase
+file_extensions:
+  - intbase
+contexts:
+  main:
+    - match: 'function'
+      scope: keyword.function.intbase
+"#;
+
+        let extended_content = r#"
+%YAML 1.2
+---
+extends: base.sublime-syntax
+name: Integration Extended  
+scope: source.intext
+file_extensions:
+  - intext
+contexts:
+  main:
+    - match: 'class'
+      scope: keyword.class.intext
+"#;
+        
+        fs::write("/tmp/syntaxset_extends_integration/base.sublime-syntax", base_content).unwrap();
+        fs::write("/tmp/syntaxset_extends_integration/extended.sublime-syntax", extended_content).unwrap();
+
+        // Load using SyntaxSetBuilder
+        let mut builder = SyntaxSetBuilder::new();
+        builder.add_from_folder("/tmp/syntaxset_extends_integration", false).unwrap();
+        let syntax_set = builder.build();
+
+        // Find the extended syntax
+        let extended_syntax = syntax_set.find_syntax_by_name("Integration Extended");
+        assert!(extended_syntax.is_some());
+        
+        let extended_syntax = extended_syntax.unwrap();
+        assert_eq!(extended_syntax.name, "Integration Extended");
+        assert_eq!(extended_syntax.scope.to_string(), "source.intext");
+        
+        // Should have both file extensions from base and extended
+        assert!(extended_syntax.file_extensions.contains(&"intbase".to_string()));
+        assert!(extended_syntax.file_extensions.contains(&"intext".to_string()));
+
+        // Clean up
+        fs::remove_dir_all("/tmp/syntaxset_extends_integration").ok();
+    }
 }
